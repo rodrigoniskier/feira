@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Minha Lista de Feira</title>
+    <!-- Tailwind CSS para um design moderno -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- FontAwesome para ícones -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+    
+    <!-- Configuração do Firebase -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, collection, doc, setDoc, updateDoc, onSnapshot, arrayUnion, arrayRemove, getDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // --- Configuração e Inicialização do Firebase ---
+        const firebaseConfig = JSON.parse(localStorage.getItem('firebase_config') || '{}') // Fallback para ambiente local
+                             || JSON.parse(__firebase_config); // Ambiente Canvas
+
+        // Se estivermos no ambiente Canvas, usamos a variável global
+        const configToUse = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : firebaseConfig;
+        
+        const app = initializeApp(configToUse);
+        const auth = getAuth(app);
+        const db = getFirestore(app);
+        
+        // ID do App para o caminho do Firestore (Regra obrigatória do ambiente)
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+
+        let currentUser = null;
+        let currentListId = null;
+        let unsubscribeListener = null;
+
+        // Autenticação Anônima (Necessária para ler/escrever no banco)
+        async function initAuth() {
+            if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                 // Login via token do ambiente (se disponível)
+                 // Nota: A função signInWithCustomToken deve ser importada se usada, mas aqui simplificamos com anônimo para este exemplo didático
+                 await signInAnonymously(auth); 
+            } else {
+                await signInAnonymously(auth);
+            }
+        }
+
+        initAuth();
+
+        onAuthStateChanged(auth, (user) => {
+            if (user) {
+                currentUser = user;
+                console.log("Usuário autenticado:", user.uid);
+                checkUrlForShare(); // Verifica se abriu via link compartilhado
+                renderRecentLists(); // Carrega histórico local
+            }
+        });
+
+        // --- Lógica da Aplicação ---
+
+        // Referência para elementos do DOM
+        const screens = {
+            home: document.getElementById('home-screen'),
+            list: document.getElementById('list-screen'),
+            loading: document.getElementById('loading-screen')
+        };
+
+        // 1. Navegação e UI
+        function showScreen(screenName) {
+            Object.values(screens).forEach(el => el.classList.add('hidden'));
+            screens[screenName].classList.remove('hidden');
+        }
+
+        // 2. Criar Nova Lista
+        window.createNewList = async () => {
+            const nameInput = document.getElementById('new-list-name');
+            const listName = nameInput.value.trim();
+
+            if (!listName) {
+                showToast("Digite um nome para a lista!", "error");
+                return;
+            }
+
+            // Gera um ID único simples baseado no tempo + random
+            const listId = 'lista_' + Date.now() + '_' + Math.floor(Math.random() * 1000);
+
+            try {
+                showScreen('loading');
+                // Caminho PÚBLICO para permitir compartilhamento: /artifacts/{appId}/public/data/shopping_lists
+                const listRef = doc(db, 'artifacts', appId, 'public', 'data', 'shopping_lists', listId);
+                
+                await setDoc(listRef, {
+                    name: listName,
+                    createdAt: new Date().toISOString(),
+                    items: [] // Array vazio de itens
+                });
+
+                saveListToHistory(listId, listName);
+                openList(listId);
+                nameInput.value = ''; // Limpar input
+            } catch (error) {
+                console.error("Erro ao criar lista:", error);
+                showToast("Erro ao criar lista. Tente novamente.", "error");
+                showScreen('home');
+            }
+        };
+
+        // 3. Abrir e Sincronizar Lista (Real-time)
+        window.openList = (listId) => {
+            currentListId = listId;
+            showScreen('loading');
+
+            // Se já houver um ouvinte ativo, cancela ele para não duplicar
+            if (unsubscribeListener) {
+                unsubscribeListener();
+            }
+
+            const listRef = doc(db, 'artifacts', appId, 'public', 'data', 'shopping_lists', listId);
+
+            // onSnapshot escuta mudanças em TEMPO REAL
+            unsubscribeListener = onSnapshot(listRef, (docSnap) => {
+                if (docSnap.exists()) {
+                    const data = docSnap.data();
+                    document.getElementById('list-title').textContent = data.name;
+                    renderItems(data.items || []);
+                    showScreen('list');
+                    
+                    // Salva no histórico caso tenha aberto via link
+                    saveListToHistory(listId, data.name);
+                } else {
+                    showToast("Lista não encontrada!", "error");
+                    showScreen('home');
+                }
+            }, (error) => {
+                console.error("Erro ao sincronizar:", error);
+                showToast("Erro de conexão.", "error");
+            });
+        };
+
+        // 4. Renderizar Itens
+        function renderItems(items) {
+            const listContainer = document.getElementById('shopping-list-items');
+            listContainer.innerHTML = '';
+
+            // Separar comprados dos não comprados para ordenação visual
+            const pending = items.filter(i => !i.bought);
+            const bought = items.filter(i => i.bought);
+            const sortedItems = [...pending, ...bought];
+
+            if (sortedItems.length === 0) {
+                listContainer.innerHTML = `
+                    <div class="text-center text-gray-400 mt-10">
+                        <i class="fas fa-carrot text-4xl mb-2"></i>
+                        <p>Sua lista está vazia.</p>
+                    </div>`;
+                return;
+            }
+
+            sortedItems.forEach(item => {
+                const el = document.createElement('div');
+                el.className = `flex items-center justify-between p-3 bg-white rounded-lg shadow-sm border-l-4 ${item.bought ? 'border-green-500 opacity-60 bg-gray-50' : 'border-blue-500'} transition-all`;
+                
+                el.innerHTML = `
+                    <div class="flex items-center gap-3 flex-1 cursor-pointer" onclick="toggleItem('${item.id}', ${item.bought})">
+                        <div class="w-6 h-6 rounded-full border-2 flex items-center justify-center ${item.bought ? 'bg-green-500 border-green-500' : 'border-gray-300'}">
+                            ${item.bought ? '<i class="fas fa-check text-white text-xs"></i>' : ''}
+                        </div>
+                        <span class="${item.bought ? 'line-through text-gray-500' : 'text-gray-800 font-medium'} text-lg">${item.text}</span>
+                    </div>
+                    <button onclick="deleteItem('${item.id}')" class="text-gray-300 hover:text-red-500 p-2">
+                        <i class="fas fa-trash"></i>
+                    </button>
+                `;
+                listContainer.appendChild(el);
+            });
+        }
+
+        // 5. Adicionar Item
+        window.addItem = async () => {
+            const input = document.getElementById('new-item-input');
+            const text = input.value.trim();
+            if (!text) return;
+
+            const newItem = {
+                id: Date.now().toString(), // ID simples para o item
+                text: text,
+                bought: false
+            };
+
+            const listRef = doc(db, 'artifacts', appId, 'public', 'data', 'shopping_lists', currentListId);
+            
+            // Adiciona ao array 'items' no Firestore
+            await updateDoc(listRef, {
+                items: arrayUnion(newItem)
+            });
+
+            input.value = '';
+            input.focus();
+        };
+
+        // 6. Marcar/Desmarcar Item
+        window.toggleItem = async (itemId, currentStatus) => {
+            const listRef = doc(db, 'artifacts', appId, 'public', 'data', 'shopping_lists', currentListId);
+            
+            // Firestore não atualiza item de array facilmente. 
+            // A estratégia mais segura para este app simples é ler, modificar e salvar.
+            // Em apps grandes, usaríamos sub-coleções.
+            
+            try {
+                const docSnap = await getDoc(listRef);
+                if (docSnap.exists()) {
+                    let items = docSnap.data().items;
+                    const itemIndex = items.findIndex(i => i.id === itemId);
+                    
+                    if (itemIndex > -1) {
+                        items[itemIndex].bought = !currentStatus;
+                        await updateDoc(listRef, { items: items });
+                    }
+                }
+            } catch (e) {
+                console.error("Erro ao atualizar item", e);
+            }
+        };
+
+        // 7. Deletar Item
+        window.deleteItem = async (itemId) => {
+             const listRef = doc(db, 'artifacts', appId, 'public', 'data', 'shopping_lists', currentListId);
+             
+             // Mesma lógica de leitura/escrita para garantir integridade
+             const docSnap = await getDoc(listRef);
+             if (docSnap.exists()) {
+                 let items = docSnap.data().items;
+                 const newItems = items.filter(i => i.id !== itemId);
+                 await updateDoc(listRef, { items: newItems });
+             }
+        };
+
+        // 8. Histórico Local (LocalStorage)
+        function saveListToHistory(id, name) {
+            let history = JSON.parse(localStorage.getItem('my_shopping_lists') || '[]');
+            // Remove se já existir para adicionar no topo
+            history = history.filter(list => list.id !== id);
+            history.unshift({ id, name, lastAccess: Date.now() });
+            localStorage.setItem('my_shopping_lists', JSON.stringify(history));
+        }
+
+        function renderRecentLists() {
+            const history = JSON.parse(localStorage.getItem('my_shopping_lists') || '[]');
+            const container = document.getElementById('recent-lists');
+            
+            if (history.length === 0) {
+                container.innerHTML = '<p class="text-gray-400 text-sm text-center">Nenhuma lista recente.</p>';
+                return;
+            }
+
+            container.innerHTML = '';
+            history.forEach(list => {
+                const el = document.createElement('div');
+                el.className = "flex justify-between items-center p-3 bg-white rounded shadow-sm mb-2 hover:bg-gray-50 cursor-pointer border border-gray-100";
+                el.onclick = () => openList(list.id);
+                el.innerHTML = `
+                    <div class="flex items-center gap-3">
+                        <div class="bg-blue-100 text-blue-600 w-8 h-8 rounded flex items-center justify-center">
+                            <i class="fas fa-list-ul"></i>
+                        </div>
+                        <span class="font-medium text-gray-700">${list.name}</span>
+                    </div>
+                    <i class="fas fa-chevron-right text-gray-300"></i>
+                `;
+                container.appendChild(el);
+            });
+        }
+
+        // 9. Compartilhar (WhatsApp)
+        window.shareList = () => {
+            // Pega a URL base atual (sem parâmetros) e adiciona o ID
+            const baseUrl = window.location.href.split('?')[0];
+            const shareUrl = `${baseUrl}?listId=${currentListId}`;
+            const listName = document.getElementById('list-title').textContent;
+            
+            const message = `Olá! Vamos fazer as compras? Aqui está a nossa lista "${listName}": ${shareUrl}`;
+            
+            // Abre API do WhatsApp
+            const whatsappUrl = `https://api.whatsapp.com/send?text=${encodeURIComponent(message)}`;
+            window.open(whatsappUrl, '_blank');
+        };
+
+        // 10. Checar URL ao iniciar
+        function checkUrlForShare() {
+            const urlParams = new URLSearchParams(window.location.search);
+            const sharedId = urlParams.get('listId');
+            
+            if (sharedId) {
+                // Se veio por link, abre direto
+                openList(sharedId);
+            } else {
+                // Senão, tela inicial
+                showScreen('home');
+            }
+        }
+
+        // Função de Toast (Notificação visual simples)
+        function showToast(message, type = 'success') {
+            const toast = document.createElement('div');
+            toast.className = `fixed bottom-4 left-1/2 transform -translate-x-1/2 px-4 py-2 rounded-full text-white text-sm shadow-lg z-50 animate-bounce ${type === 'error' ? 'bg-red-500' : 'bg-gray-800'}`;
+            toast.textContent = message;
+            document.body.appendChild(toast);
+            setTimeout(() => toast.remove(), 3000);
+        }
+
+        // Voltar para Home
+        window.goHome = () => {
+            // Limpa a URL visualmente sem recarregar (opcional, para ficar bonito)
+            const url = new URL(window.location);
+            url.searchParams.delete('listId');
+            window.history.pushState({}, '', url);
+            
+            currentListId = null;
+            if(unsubscribeListener) unsubscribeListener();
+            renderRecentLists();
+            showScreen('home');
+        };
+
+        // Adicionar item com Enter
+        document.getElementById('new-item-input')?.addEventListener('keypress', function (e) {
+            if (e.key === 'Enter') window.addItem();
+        });
+    </script>
+</head>
+<body class="bg-gray-100 text-gray-800 font-sans h-screen flex flex-col overflow-hidden">
+
+    <!-- Tela de Carregamento -->
+    <div id="loading-screen" class="hidden flex flex-col items-center justify-center h-full">
+        <div class="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600 mb-4"></div>
+        <p class="text-gray-500">Carregando...</p>
+    </div>
+
+    <!-- TELA INICIAL -->
+    <div id="home-screen" class="flex flex-col h-full hidden">
+        <header class="bg-blue-600 p-6 shadow-md rounded-b-3xl mb-4">
+            <h1 class="text-2xl font-bold text-white mb-1"><i class="fas fa-shopping-basket mr-2"></i>Minha Feira</h1>
+            <p class="text-blue-100 text-sm">Organize suas compras facilmente</p>
+        </header>
+
+        <main class="flex-1 px-4 overflow-y-auto">
+            <!-- Criar Nova Lista -->
+            <div class="bg-white p-4 rounded-xl shadow-sm mb-6">
+                <h2 class="text-lg font-semibold mb-3 text-gray-700">Nova Lista</h2>
+                <div class="flex gap-2">
+                    <input type="text" id="new-list-name" placeholder="Ex: Churrasco de Domingo" 
+                           class="flex-1 bg-gray-50 border border-gray-200 rounded-lg px-4 py-3 outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-all">
+                    <button onclick="createNewList()" 
+                            class="bg-blue-600 hover:bg-blue-700 text-white px-5 py-3 rounded-lg font-medium transition-colors">
+                        <i class="fas fa-plus"></i>
+                    </button>
+                </div>
+            </div>
+
+            <!-- Listas Recentes -->
+            <h2 class="text-sm font-bold text-gray-400 uppercase tracking-wider mb-3 px-1">Listas Recentes</h2>
+            <div id="recent-lists" class="space-y-2 pb-20">
+                <!-- Javascript preenche aqui -->
+            </div>
+        </main>
+    </div>
+
+    <!-- TELA DA LISTA -->
+    <div id="list-screen" class="flex flex-col h-full hidden bg-gray-50">
+        <!-- Cabeçalho Fixo -->
+        <header class="bg-white p-4 shadow-sm flex items-center justify-between sticky top-0 z-10">
+            <div class="flex items-center gap-3 overflow-hidden">
+                <button onclick="goHome()" class="text-gray-400 hover:text-gray-600 p-2 rounded-full hover:bg-gray-100 transition-colors">
+                    <i class="fas fa-arrow-left text-lg"></i>
+                </button>
+                <h1 id="list-title" class="text-xl font-bold text-gray-800 truncate">Carregando...</h1>
+            </div>
+            <button onclick="shareList()" class="text-green-600 bg-green-50 hover:bg-green-100 px-3 py-2 rounded-lg text-sm font-medium transition-colors flex items-center gap-2">
+                <i class="fab fa-whatsapp text-lg"></i> <span class="hidden sm:inline">Compartilhar</span>
+            </button>
+        </header>
+
+        <!-- Lista de Itens (Scrollável) -->
+        <main class="flex-1 overflow-y-auto p-4">
+            <div id="shopping-list-items" class="space-y-3 pb-24">
+                <!-- Javascript preenche aqui -->
+            </div>
+        </main>
+
+        <!-- Input Fixo no Rodapé -->
+        <footer class="bg-white p-4 border-t border-gray-200 sticky bottom-0 z-20">
+            <div class="flex gap-2 shadow-sm rounded-lg bg-gray-100 p-1">
+                <input type="text" id="new-item-input" placeholder="Adicionar item..." 
+                       class="flex-1 bg-transparent border-none px-4 py-3 outline-none text-gray-700 placeholder-gray-400">
+                <button onclick="addItem()" class="bg-blue-600 text-white w-12 h-12 rounded-lg flex items-center justify-center hover:bg-blue-700 transition-colors shadow-md">
+                    <i class="fas fa-plus"></i>
+                </button>
+            </div>
+        </footer>
+    </div>
+
+</body>
+</html>
